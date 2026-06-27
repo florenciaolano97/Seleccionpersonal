@@ -460,6 +460,116 @@ def get_openai_api_key():
     return os.getenv("OPENAI_API_KEY")
 
 
+
+# =========================================================
+# FUNCIONES V2 - ENTREVISTADOR VIRTUAL Y CONTROL HUMANO
+# =========================================================
+
+KNOCKOUT_RULES = {
+    "Operario/a de inyección plástica": [
+        ("turnos_rotativos", "¿Puede trabajar turnos rotativos?"),
+        ("epp_seguridad", "¿Acepta usar EPP y cumplir procedimientos de seguridad?"),
+        ("tareas_repetitivas", "¿Acepta tareas repetitivas de producción y control visual?"),
+    ],
+    "Control de calidad": [
+        ("registro_trazabilidad", "¿Acepta registrar controles y trazabilidad con rigurosidad?"),
+        ("criterio_nc", "¿Acepta escalar o bloquear una no conformidad aunque haya presión productiva?"),
+        ("atencion_detalle", "¿Puede sostener tareas repetitivas con atención al detalle?"),
+    ],
+    "Mantenimiento / cambio de moldes": [
+        ("seguridad_bloqueo", "¿Acepta bloquear/asegurar la máquina antes de intervenir?"),
+        ("formacion_tecnica", "¿Cuenta con formación o experiencia técnica compatible?"),
+        ("guardias_turnos", "¿Tiene disponibilidad para urgencias, turnos o guardias según necesidad?"),
+    ],
+    "Depósito / logística interna": [
+        ("orden_stock", "¿Acepta trabajar con registros, stock, lotes y trazabilidad?"),
+        ("seguridad_cargas", "¿Acepta normas de seguridad para movimiento de materiales?"),
+        ("prioridades", "¿Puede manejar varias prioridades operativas al mismo tiempo?"),
+    ],
+    "Supervisor/a o líder de turno": [
+        ("liderazgo_seguro", "¿Prioriza seguridad y calidad por encima de producir más rápido?"),
+        ("gestion_conflictos", "¿Tiene experiencia o criterio para manejar conflictos del equipo?"),
+        ("indicadores", "¿Puede trabajar con objetivos, registros e indicadores de turno?"),
+    ],
+}
+
+NEGATIVE_VALUES = {"No", "No declarado", "No estoy seguro/a"}
+
+
+def simple_cv_parser(cv_text: str) -> dict:
+    """Extrae señales simples del CV para acelerar screening sin usar datos sensibles."""
+    t = safe_lower(cv_text)
+    signals = {
+        "industria": any(w in t for w in ["industria", "fábrica", "fabrica", "producción", "produccion", "planta"]),
+        "autopartista_plastica": any(w in t for w in ["autopart", "inyección", "inyeccion", "plástico", "plastico", "molde", "matriz"]),
+        "calidad": any(w in t for w in ["calidad", "inspección", "inspeccion", "no conformidad", "control visual"]),
+        "mantenimiento": any(w in t for w in ["mantenimiento", "eléctr", "electric", "mecán", "mecan", "neumática", "neumatica", "hidrául"]),
+        "logistica": any(w in t for w in ["depósito", "deposito", "logística", "logistica", "stock", "inventario", "picking"]),
+        "liderazgo": any(w in t for w in ["supervisor", "líder", "lider", "coordin", "equipo a cargo"]),
+        "instrumentos_medicion": any(w in t for w in ["calibre", "pie de rey", "galga", "micrómetro", "micrometro", "vernier"]),
+        "turnos_disponibilidad": any(w in t for w in ["turno", "rotativo", "noche", "disponibilidad", "horas extra"]),
+    }
+    return signals
+
+
+def build_followup_questions(role_name: str, cv_text: str, answers_text: str, max_questions: int = 4):
+    """Genera repreguntas adaptativas locales según brechas detectadas."""
+    full = safe_lower(cv_text + "\n" + answers_text)
+    cv_signals = simple_cv_parser(cv_text)
+    followups = []
+
+    if role_name == "Operario/a de inyección plástica":
+        if not cv_signals["autopartista_plastica"]:
+            followups.append("No se observa experiencia clara en inyección plástica/autopartista. ¿Qué experiencia similar de producción o línea industrial podés contar?")
+        if "epp" not in full and "seguridad" not in full:
+            followups.append("¿Qué EPP usarías en planta y qué harías si una máquina o tarea parece insegura?")
+        if "defecto" not in full and "calidad" not in full:
+            followups.append("¿Qué defectos visuales revisarías antes de liberar o empacar una pieza?")
+    elif role_name == "Control de calidad":
+        if not cv_signals["instrumentos_medicion"]:
+            followups.append("No queda claro si usaste instrumentos de medición. ¿Trabajaste con calibre, galgas, plantillas o registros de control?")
+        if "no conformidad" not in full and "rechaz" not in full:
+            followups.append("¿Qué harías si encontrás una pieza dudosa pero producción necesita cumplir el objetivo del turno?")
+    elif role_name == "Mantenimiento / cambio de moldes":
+        if "bloqueo" not in full and "energía cero" not in full and "energia cero" not in full:
+            followups.append("Antes de intervenir una máquina, ¿qué pasos de seguridad y bloqueo aplicarías?")
+        if not cv_signals["mantenimiento"]:
+            followups.append("No se ve experiencia técnica clara. ¿Qué formación o trabajos técnicos hiciste en mecánica, electricidad, neumática o hidráulica?")
+    elif role_name == "Depósito / logística interna":
+        if "lote" not in full and "trazabilidad" not in full:
+            followups.append("¿Cómo evitarías mezcla de lotes o errores de material al abastecer una línea?")
+        if not cv_signals["logistica"]:
+            followups.append("No queda clara tu experiencia logística. ¿Trabajaste con stock, inventario, recepción, despacho o picking?")
+    elif role_name == "Supervisor/a o líder de turno":
+        if "conflicto" not in full:
+            followups.append("Contame una situación concreta en la que resolviste un conflicto entre compañeros o dentro de un equipo.")
+        if "indicador" not in full and "kpi" not in full and "scrap" not in full:
+            followups.append("¿Qué indicadores mirarías para saber si un turno productivo fue bueno?")
+
+    if not followups:
+        followups.append("Para cerrar, contame un ejemplo concreto de una situación laboral donde tuviste que aprender rápido o adaptarte a una exigencia nueva.")
+    return followups[:max_questions]
+
+
+def knockout_summary(knockout_answers: dict) -> dict:
+    negatives = [label for label, value in knockout_answers.items() if value in NEGATIVE_VALUES]
+    if len(negatives) >= 2:
+        status = "Alerta fuerte: revisar posible rechazo por requisitos excluyentes."
+    elif len(negatives) == 1:
+        status = "Alerta moderada: requiere validación humana."
+    else:
+        status = "Sin alertas excluyentes declaradas."
+    return {"negatives": negatives, "status": status, "count": len(negatives)}
+
+
+def human_decision_required_text(ai_recommendation: str) -> str:
+    if "REVISIÓN" in ai_recommendation:
+        return "Obligatoria: el caso quedó en zona intermedia."
+    if "RECHAZAR" in ai_recommendation:
+        return "Obligatoria antes de comunicar rechazo."
+    return "Obligatoria antes de avanzar formalmente a la siguiente etapa."
+
+
 def ai_evaluate(role_name: str, candidate_text: str, cv_text: str, strict_binary: bool = False, model: str = "gpt-4.1-mini"):
     api_key = get_openai_api_key()
     if not api_key or OpenAI is None:
@@ -621,11 +731,12 @@ with st.sidebar:
 
 profile = ROLE_PROFILES[role_name]
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "1. Puesto y candidato",
-    "2. Entrevista estructurada",
+    "2. Entrevista virtual",
     "3. Evaluación IA",
-    "4. Historial y exportación",
+    "4. Decisión humana",
+    "5. Historial, ranking y dashboard",
 ])
 
 with tab1:
@@ -666,15 +777,40 @@ with tab1:
         placeholder="Pegar experiencia laboral relevante, formación técnica, disponibilidad y observaciones objetivas.",
     )
 
+    if cv_text.strip():
+        st.markdown("### Lectura rápida del CV")
+        cv_signals_df = pd.DataFrame([
+            {"Señal detectada": k.replace("_", " ").capitalize(), "Resultado": "Sí" if v else "No"}
+            for k, v in simple_cv_parser(cv_text).items()
+        ])
+        st.dataframe(cv_signals_df, use_container_width=True, hide_index=True)
+
     consent = st.checkbox(
         "Confirmo que el candidato fue informado de que se usará una herramienta de asistencia para preselección y que la decisión final será humana.",
         value=False,
     )
 
 with tab2:
-    st.subheader("Entrevista estructurada sugerida")
-    st.caption("Usar las mismas preguntas para candidatos del mismo puesto mejora la comparabilidad y reduce sesgos.")
+    st.subheader("Entrevista virtual estructurada + adaptativa")
+    st.caption("Primero validá requisitos excluyentes. Luego usá preguntas base y repreguntas adaptativas.")
 
+    st.markdown("### Filtro excluyente inicial")
+    knockout_answers = {}
+    for rule_key, rule_question in KNOCKOUT_RULES.get(role_name, []):
+        knockout_answers[rule_question] = st.selectbox(
+            rule_question,
+            ["Sí", "No", "No declarado", "No estoy seguro/a"],
+            key=f"knockout_{role_name}_{rule_key}",
+        )
+    ko = knockout_summary(knockout_answers)
+    if ko["count"] >= 2:
+        st.error(ko["status"])
+    elif ko["count"] == 1:
+        st.warning(ko["status"])
+    else:
+        st.success(ko["status"])
+
+    st.divider()
     questions = profile["questions"]
     answers = {}
     for i, q in enumerate(questions, start=1):
@@ -687,6 +823,16 @@ with tab2:
         placeholder="Ejemplo: respondió con ejemplos concretos, reconoce uso de EPP, no pudo precisar experiencia en medición, etc.",
     )
 
+    st.divider()
+    base_answers_text = make_answers_text(questions, answers)
+    followup_questions = build_followup_questions(role_name, cv_text, base_answers_text)
+    st.markdown("### Repreguntas adaptativas sugeridas")
+    st.caption("Se generan según el CV y las respuestas. Sirven para profundizar antes de evaluar.")
+    followup_answers = {}
+    for i, q in enumerate(followup_questions, start=1):
+        st.markdown(f"**Repregunta {i}. {q}**")
+        followup_answers[f"followup_{i}"] = st.text_area(f"Respuesta repregunta {i}", key=f"followup_{role_name}_{i}", height=80)
+
 with tab3:
     st.subheader("Evaluación y recomendación")
     st.caption("La recomendación se basa en evidencias laborales relacionadas con el puesto. No debe reemplazar la decisión humana.")
@@ -696,7 +842,15 @@ with tab3:
             st.error("Antes de evaluar, confirmá el consentimiento/información al candidato en la pestaña 1.")
             st.stop()
 
-        candidate_text = make_answers_text(questions, answers) + "\n\nObservaciones entrevistador:\n" + free_notes
+        candidate_text = (
+            make_answers_text(questions, answers)
+            + "\n\nFiltro excluyente inicial:\n"
+            + json.dumps(knockout_answers, ensure_ascii=False)
+            + "\n\nRepreguntas adaptativas:\n"
+            + make_answers_text(followup_questions, followup_answers)
+            + "\n\nObservaciones entrevistador:\n"
+            + free_notes
+        )
 
         result = None
         error = None
@@ -738,6 +892,8 @@ with tab3:
             render_metric_card("Puntaje global", f"{score}/100")
         with col3:
             render_metric_card("Confianza", confidence)
+
+        st.info("Decisión humana: " + human_decision_required_text(rec))
 
         if "APROBAR" in rec:
             st.markdown(f"<div class='ok-box'><b>Resultado:</b> {rec}</div>", unsafe_allow_html=True)
@@ -796,6 +952,8 @@ with tab3:
             "riesgos": " | ".join(result.get("risks", [])),
             "alertas": " | ".join(result.get("red_flags", [])),
             "datos_sensibles_detectados": " | ".join(result.get("sensitive_data_detected", [])),
+            "filtro_excluyente": json.dumps(knockout_answers, ensure_ascii=False),
+            "alerta_filtro_excluyente": ko.get("status", ""),
             "modelo": result.get("model_used", ""),
             "cv_texto": st.session_state.get("last_cv_text", ""),
             "entrevista_texto": st.session_state.get("last_candidate_text", ""),
@@ -830,13 +988,70 @@ with tab3:
             )
 
 with tab4:
-    st.subheader("Historial de evaluaciones")
+    st.subheader("Decisión humana final")
+    st.caption("La recomendación IA no reemplaza la decisión de RR.HH. / jefatura. Registrá siempre la decisión final.")
+
+    result = st.session_state.get("last_result")
+    if not result:
+        st.info("Primero evaluá un candidato en la pestaña 3.")
+    else:
+        st.write(f"**Recomendación IA:** {result.get('recommendation', '')}")
+        human_final_decision = st.selectbox(
+            "Decisión final humana",
+            ["Pendiente", "Avanza a entrevista humana", "Avanza a prueba técnica", "Mantener en base", "No avanza"],
+        )
+        human_reason = st.text_area(
+            "Motivo laboral de la decisión humana",
+            placeholder="Ejemplo: cumple disponibilidad y seguridad, pero requiere validar experiencia técnica con el líder de planta.",
+            height=120,
+        )
+        decision_owner = st.text_input("Responsable de decisión", value=interviewer)
+
+        if st.button("Guardar decisión humana", type="primary", use_container_width=True):
+            decision_row = {
+                "fecha_hora": now_str(),
+                "codigo_candidato": st.session_state.get("last_candidate_code", ""),
+                "puesto": st.session_state.get("last_role_name", role_name),
+                "recomendacion_ia": result.get("recommendation", ""),
+                "puntaje_ia": result.get("score", ""),
+                "decision_humana": human_final_decision,
+                "motivo_decision_humana": human_reason,
+                "responsable_decision": decision_owner,
+            }
+            decision_file = DATA_DIR / "decisiones_humanas.csv"
+            df_decision = pd.DataFrame([decision_row])
+            if decision_file.exists():
+                old_decision = pd.read_csv(decision_file)
+                df_decision = pd.concat([old_decision, df_decision], ignore_index=True)
+            df_decision.to_csv(decision_file, index=False)
+            st.success("Decisión humana guardada correctamente.")
+            st.json(decision_row, expanded=False)
+
+with tab5:
+    st.subheader("Historial, ranking y dashboard")
     hist = read_history()
 
     if hist.empty:
         st.info("Todavía no hay evaluaciones guardadas.")
     else:
-        st.dataframe(hist, use_container_width=True)
+        st.markdown("### Ranking por búsqueda / puesto")
+        ranking_cols = [c for c in ["codigo_candidato", "puesto", "fuente", "recomendacion", "puntaje", "confianza"] if c in hist.columns]
+        hist_rank = hist.sort_values("puntaje", ascending=False) if "puntaje" in hist.columns else hist
+        st.dataframe(hist_rank[ranking_cols], use_container_width=True, hide_index=True)
+
+        st.markdown("### Dashboard básico")
+        col_m1, col_m2, col_m3 = st.columns(3)
+        col_m1.metric("Evaluaciones", len(hist))
+        if "puntaje" in hist.columns:
+            col_m2.metric("Score promedio", round(pd.to_numeric(hist["puntaje"], errors="coerce").mean(), 1))
+        if "recomendacion" in hist.columns:
+            col_m3.metric("Revisión humana", int(hist["recomendacion"].astype(str).str.contains("REVISIÓN", case=False, na=False).sum()))
+            rec_counts = hist["recomendacion"].value_counts().reset_index()
+            rec_counts.columns = ["Recomendación", "Cantidad"]
+            st.bar_chart(rec_counts.set_index("Recomendación"))
+
+        with st.expander("Ver historial completo"):
+            st.dataframe(hist, use_container_width=True)
 
         col1, col2 = st.columns(2)
         with col1:
