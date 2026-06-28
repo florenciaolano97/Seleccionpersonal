@@ -1,57 +1,103 @@
 import os
 import io
-import time
+import re
 import json
+import time
 import base64
 import tempfile
 from datetime import datetime
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
-from openai import OpenAI
 from streamlit_mic_recorder import mic_recorder
 
 try:
-    from streamlit_webrtc import webrtc_streamer, VideoHTMLAttributes, WebRtcMode
+    from faster_whisper import WhisperModel
+    FASTER_WHISPER_AVAILABLE = True
+except Exception:
+    FASTER_WHISPER_AVAILABLE = False
+
+try:
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase, RTCConfiguration
+    import av
+    import cv2
     WEBRTC_AVAILABLE = True
 except Exception:
     WEBRTC_AVAILABLE = False
 
-APP_TITLE = "AI-RRHH | Alba entrevistadora virtual"
+try:
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+except Exception:
+    MEDIAPIPE_AVAILABLE = False
+
+APP_TITLE = "AI-RRHH | Alba entrevistadora virtual local"
 DID_API_URL = "https://api.d-id.com/talks"
-DID_VOICE_ID = "es-AR-ElenaNeural"
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
-HISTORY_FILE = os.path.join(DATA_DIR, "entrevistas_alba.csv")
-AUDIO_DIR = os.path.join(DATA_DIR, "audios")
-os.makedirs(AUDIO_DIR, exist_ok=True)
+DEFAULT_DID_VOICE = "es-AR-ElenaNeural"
+OLLAMA_URL_DEFAULT = "http://localhost:11434/api/generate"
+DATA_DIR = Path("data")
+AUDIO_DIR = DATA_DIR / "audios"
+DATA_DIR.mkdir(exist_ok=True)
+AUDIO_DIR.mkdir(exist_ok=True)
+HISTORY_FILE = DATA_DIR / "entrevistas_alba_local.csv"
 
-QUESTIONS = [
-    "Hola, soy Alba, tu entrevistadora virtual de Recursos Humanos. Para comenzar, contame tu experiencia previa en producción, inyección plástica, autopartes o líneas industriales.",
-    "¿Qué elementos de protección personal usarías y qué harías si una máquina parece insegura?",
-    "Contame una situación en la que hayas tenido que seguir una instrucción precisa o un estándar de trabajo.",
-    "¿Qué defectos visuales buscarías en una pieza plástica antes de liberarla o empacarla?",
-    "¿Tenés disponibilidad para turnos rotativos, noche o fines de semana según necesidad productiva?",
-    "¿Cómo actuarías si ves que un compañero saltea un paso de seguridad para producir más rápido?",
-]
+ROLE_QUESTIONS = {
+    "Operario/a de inyección plástica": [
+        "Hola, soy Alba, tu entrevistadora virtual de Recursos Humanos. Para comenzar, contame tu experiencia previa en producción, inyección plástica, autopartes o líneas industriales.",
+        "¿Qué elementos de protección personal usarías y qué harías si una máquina parece insegura?",
+        "Contame una situación en la que hayas tenido que seguir una instrucción precisa o un estándar de trabajo.",
+        "¿Qué defectos visuales buscarías en una pieza plástica antes de liberarla o empacarla?",
+        "¿Tenés disponibilidad para turnos rotativos, noche o fines de semana según necesidad productiva?",
+        "¿Cómo actuarías si ves que un compañero saltea un paso de seguridad para producir más rápido?",
+    ],
+    "Control de calidad": [
+        "Hola, soy Alba. Para comenzar, contame tu experiencia en control de calidad, inspección visual, medición o registros.",
+        "¿Qué harías si encontrás una pieza fuera de especificación pero producción necesita cumplir el objetivo del turno?",
+        "¿Usaste calibre, pie de rey, galgas, plantillas, planillas de control o sistemas de trazabilidad?",
+        "¿Cómo documentarías una no conformidad para que sea útil y objetiva?",
+        "¿Cómo comunicarías un problema de calidad a producción sin generar conflicto?",
+        "¿Qué harías si no estás seguro de si un defecto es aceptable o no?",
+    ],
+    "Mantenimiento / cambio de moldes": [
+        "Hola, soy Alba. Para comenzar, contame tu experiencia en mantenimiento industrial, inyectoras, moldes, neumática, hidráulica o electricidad.",
+        "¿Qué pasos de seguridad harías antes de intervenir una máquina?",
+        "¿Cómo diagnosticarías una falla repetitiva en una inyectora o periférico?",
+        "¿Participaste en cambios de molde, ajustes de proceso o mantenimiento preventivo?",
+        "¿Cómo registrás una intervención para que sirva al turno siguiente?",
+        "¿Qué harías si producción te presiona para reparar rápido salteando un paso de seguridad?",
+    ],
+}
 
-EVAL_COMPETENCIES = [
+COMPETENCIES = [
     "Experiencia industrial/autopartista",
-    "Seguridad y uso de EPP",
+    "Seguridad y EPP",
     "Calidad y atención al detalle",
     "Disciplina operativa",
     "Comunicación verbal",
     "Disponibilidad operativa",
 ]
 
-SAFE_NONVERBAL_CRITERIA = [
-    "Cámara encendida durante la respuesta",
-    "Audio comprensible",
-    "Respuesta ordenada y entendible",
-    "No se observan interrupciones técnicas graves",
+KEYWORDS = {
+    "Experiencia industrial/autopartista": ["producción", "linea", "línea", "fábrica", "industria", "inyección", "inyectora", "plástico", "autoparte", "autopartista", "operario", "máquina", "molde"],
+    "Seguridad y EPP": ["epp", "guantes", "lentes", "protección", "seguridad", "procedimiento", "riesgo", "accidente", "bloqueo", "detener", "avisar", "supervisor"],
+    "Calidad y atención al detalle": ["calidad", "defecto", "rebaba", "fisura", "mancha", "deformación", "control", "inspección", "no conformidad", "medición", "calibre"],
+    "Disciplina operativa": ["instrucción", "procedimiento", "estándar", "cumplir", "orden", "puntual", "responsable", "supervisor", "pasos"],
+    "Comunicación verbal": ["comunicar", "avisar", "explicar", "consultar", "equipo", "compañero", "supervisor", "respeto"],
+    "Disponibilidad operativa": ["turno", "rotativo", "noche", "fines de semana", "disponibilidad", "horas extra", "franco"],
+}
+
+RED_FLAGS = [
+    r"no uso epp", r"sin epp", r"no respeto procedimiento", r"salte(o|ar) seguridad",
+    r"no acepto indicaciones", r"no sigo instrucciones", r"llego tarde siempre",
+    r"no puedo turnos", r"no trabajo de noche", r"no puedo rotar"
 ]
+
+
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def get_secret(name: str, default: str = "") -> str:
@@ -63,409 +109,374 @@ def get_secret(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
-def client_openai(api_key: str) -> Optional[OpenAI]:
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key)
-
-
 def did_headers(api_key: str) -> Dict[str, str]:
-    # D-ID API key is usually copied as username:password and must be Basic base64(username:password)
     raw = api_key.strip()
     if raw.lower().startswith("basic "):
         auth = raw
     else:
-        encoded = base64.b64encode(raw.encode("utf-8")).decode("utf-8")
-        auth = f"Basic {encoded}"
+        auth = "Basic " + base64.b64encode(raw.encode("utf-8")).decode("utf-8")
     return {"Authorization": auth, "Content-Type": "application/json"}
 
 
-def create_did_talk(text: str, api_key: str, source_url: str, voice_id: str = DID_VOICE_ID) -> Dict:
+def create_did_video(text: str, api_key: str, source_url: str, voice_id: str) -> str:
     payload = {
-        "source_url": source_url,
+        "source_url": source_url.strip(),
         "script": {
             "type": "text",
             "input": text,
             "provider": {"type": "microsoft", "voice_id": voice_id},
         },
-        "config": {
-            "fluent": True,
-            "pad_audio": 0.2,
-            "stitch": True,
-        },
+        "config": {"fluent": True, "pad_audio": 0.2, "stitch": True},
     }
     r = requests.post(DID_API_URL, headers=did_headers(api_key), json=payload, timeout=60)
     if r.status_code >= 400:
         raise RuntimeError(f"D-ID error {r.status_code}: {r.text}")
-    return r.json()
-
-
-def poll_did_talk(talk_id: str, api_key: str, timeout_seconds: int = 120) -> Dict:
-    url = f"{DID_API_URL}/{talk_id}"
-    started = time.time()
-    last = {}
-    while time.time() - started < timeout_seconds:
-        r = requests.get(url, headers=did_headers(api_key), timeout=30)
-        if r.status_code >= 400:
-            raise RuntimeError(f"D-ID polling error {r.status_code}: {r.text}")
-        data = r.json()
-        last = data
-        if data.get("status") == "done" and data.get("result_url"):
-            return data
-        if data.get("status") in ["error", "rejected"]:
-            raise RuntimeError(f"D-ID status {data.get('status')}: {json.dumps(data, ensure_ascii=False)}")
-        time.sleep(2)
-    raise TimeoutError(f"D-ID tardó demasiado. Último estado: {json.dumps(last, ensure_ascii=False)}")
-
-
-def generate_avatar_video(question: str, did_key: str, source_url: str) -> str:
-    talk = create_did_talk(question, did_key, source_url)
-    talk_id = talk.get("id")
+    talk_id = r.json().get("id")
     if not talk_id:
-        raise RuntimeError(f"D-ID no devolvió id: {talk}")
-    done = poll_did_talk(talk_id, did_key)
-    return done["result_url"]
+        raise RuntimeError(f"D-ID no devolvió id: {r.text}")
+    status_url = f"{DID_API_URL}/{talk_id}"
+    started = time.time()
+    while time.time() - started < 150:
+        s = requests.get(status_url, headers=did_headers(api_key), timeout=30)
+        if s.status_code >= 400:
+            raise RuntimeError(f"D-ID polling error {s.status_code}: {s.text}")
+        data = s.json()
+        if data.get("status") == "done" and data.get("result_url"):
+            return data["result_url"]
+        if data.get("status") in ["error", "rejected"]:
+            raise RuntimeError(f"D-ID rechazó el video: {json.dumps(data, ensure_ascii=False)}")
+        time.sleep(2)
+    raise TimeoutError("D-ID tardó demasiado en generar el video.")
 
 
-def save_audio_bytes(audio_data: Dict, candidate_code: str, q_index: int) -> Optional[str]:
-    if not audio_data or "bytes" not in audio_data:
-        return None
-    ext = "wav"
-    mime = audio_data.get("mime_type") or "audio/wav"
-    if "webm" in mime:
-        ext = "webm"
-    elif "mp3" in mime:
-        ext = "mp3"
-    path = os.path.join(AUDIO_DIR, f"{candidate_code}_pregunta_{q_index+1}.{ext}")
-    with open(path, "wb") as f:
-        f.write(audio_data["bytes"])
-    return path
+@st.cache_resource(show_spinner=False)
+def load_whisper_model(model_size: str, device: str, compute_type: str):
+    if not FASTER_WHISPER_AVAILABLE:
+        raise RuntimeError("faster-whisper no está instalado. Ejecutá: pip install faster-whisper")
+    return WhisperModel(model_size, device=device, compute_type=compute_type)
 
 
-def transcribe_audio(audio_path: str, openai_key: str) -> str:
-    client = client_openai(openai_key)
-    if client is None:
-        raise RuntimeError("Falta OPENAI_API_KEY para transcribir audio.")
-    with open(audio_path, "rb") as f:
-        result = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=f,
-            language="es",
-        )
-    return result.text
-
-
-def evaluate_answers(candidate_code: str, role_name: str, answers: List[Dict], camera_on: bool, openai_key: str) -> Dict:
-    combined = "\n\n".join([f"Pregunta: {a['question']}\nRespuesta: {a['answer']}" for a in answers])
-    if not openai_key:
-        return local_basic_eval(combined, camera_on)
-    client = client_openai(openai_key)
-    prompt = f"""
-Sos un especialista de Recursos Humanos para preselección inicial en una empresa autopartista plástica.
-Evaluá SOLO evidencia laboral de las respuestas. No uses datos sensibles como edad, salud, embarazo, religión, política, estado civil, familia, nacionalidad, orientación sexual, discapacidad o domicilio.
-
-Puesto: {role_name}
-Candidato: {candidate_code}
-Cámara encendida declarada por sistema: {camera_on}
-
-Respuestas:
-{combined}
-
-Devolvé exclusivamente JSON válido con:
-recommendation: APROBAR PRIMERA INSTANCIA | REVISIÓN HUMANA | RECHAZAR PRIMERA INSTANCIA
-score: entero 0-100
-confidence: Baja | Media | Alta
-competency_scores: objeto con puntajes 0-100 para {EVAL_COMPETENCIES}
-verbal_observations: lista breve sobre claridad, orden y especificidad de respuestas. No evalúes acento, apariencia ni emoción.
-nonverbal_observations: lista breve SOLO con observables seguros: cámara encendida, continuidad técnica, audio comprensible. No infieras personalidad, emociones, salud ni honestidad por gestos.
-strengths: lista breve
-risks: lista breve
-rationale: fundamento laboral claro y auditable
-human_review_required: boolean
-"""
-    response = client.responses.create(model="gpt-4.1-mini", input=prompt, temperature=0.2)
-    raw = response.output_text.strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`").replace("json", "", 1).strip()
+def transcribe_local(audio_bytes: bytes, suffix: str, model_size: str, device: str, compute_type: str) -> str:
+    if not audio_bytes:
+        return ""
+    suffix = suffix if suffix.startswith(".") else ".webm"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
     try:
-        return json.loads(raw)
+        model = load_whisper_model(model_size, device, compute_type)
+        segments, _ = model.transcribe(tmp_path, language="es", vad_filter=True)
+        return " ".join([seg.text.strip() for seg in segments]).strip()
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def call_ollama(prompt: str, model: str, url: str, timeout: int = 90) -> Optional[str]:
+    try:
+        r = requests.post(url, json={"model": model, "prompt": prompt, "stream": False}, timeout=timeout)
+        if r.status_code >= 400:
+            return None
+        return r.json().get("response", "").strip()
     except Exception:
-        return {"recommendation": "REVISIÓN HUMANA", "score": 0, "confidence": "Baja", "rationale": raw, "human_review_required": True}
+        return None
 
 
-def local_basic_eval(text: str, camera_on: bool) -> Dict:
-    t = text.lower()
-    score = 35
-    if any(w in t for w in ["epp", "guantes", "lentes", "seguridad", "protección"]):
-        score += 20
-    if any(w in t for w in ["inyección", "inyectora", "autoparte", "producción", "línea"]):
-        score += 20
-    if any(w in t for w in ["calidad", "defecto", "rebaba", "control", "pieza"]):
-        score += 15
-    if camera_on:
-        score += 5
-    score = min(score, 100)
-    if score >= 75:
-        rec = "APROBAR PRIMERA INSTANCIA"
-    elif score < 55:
+def local_score(text: str) -> Dict:
+    low = text.lower()
+    comp_scores = {}
+    for comp, words in KEYWORDS.items():
+        hits = sum(1 for w in words if w.lower() in low)
+        length_bonus = min(len(text.split()) / 90, 1) * 20
+        comp_scores[comp] = int(min((hits / 5) * 80 + length_bonus, 100))
+    red = []
+    for pat in RED_FLAGS:
+        if re.search(pat, low):
+            red.append(pat)
+    avg = int(sum(comp_scores.values()) / len(comp_scores)) if comp_scores else 0
+    if red or avg < 50:
         rec = "RECHAZAR PRIMERA INSTANCIA"
+    elif avg >= 72:
+        rec = "APROBAR PRIMERA INSTANCIA"
     else:
         rec = "REVISIÓN HUMANA"
+    strengths = [f"{k}: {v}/100" for k, v in comp_scores.items() if v >= 70]
+    risks = [f"{k}: evidencia insuficiente ({v}/100)" for k, v in comp_scores.items() if v < 45]
+    if red:
+        risks.append("Alertas detectadas: " + ", ".join(red))
+    return {"score": avg, "recommendation": rec, "competency_scores": comp_scores, "strengths": strengths, "risks": risks}
+
+
+def ollama_evaluate(transcript: str, role: str, model: str, url: str) -> Dict:
+    base = local_score(transcript)
+    prompt = f"""
+Actuá como especialista de RRHH industrial. Evaluá esta respuesta de entrevista para el puesto {role}.
+No uses ni infieras edad, salud, género, estado civil, nacionalidad, religión, política ni datos familiares.
+Respondé SOLO JSON válido con: recommendation, score, strengths, risks, rationale, follow_up_question.
+Recomendaciones permitidas: APROBAR PRIMERA INSTANCIA, REVISIÓN HUMANA, RECHAZAR PRIMERA INSTANCIA.
+Respuesta del candidato:
+{transcript}
+"""
+    out = call_ollama(prompt, model, url)
+    if out:
+        try:
+            match = re.search(r"\{.*\}", out, re.S)
+            data = json.loads(match.group(0) if match else out)
+            data.setdefault("competency_scores", base["competency_scores"])
+            return data
+        except Exception:
+            pass
     return {
-        "recommendation": rec,
-        "score": score,
-        "confidence": "Media",
-        "competency_scores": {},
-        "verbal_observations": ["Evaluación local básica por palabras clave. Para análisis completo configurá OPENAI_API_KEY."],
-        "nonverbal_observations": ["Cámara encendida declarada." if camera_on else "No se confirmó cámara encendida."],
-        "strengths": [],
-        "risks": [],
-        "rationale": "Resultado preliminar por reglas locales. La decisión final debe ser humana.",
-        "human_review_required": rec == "REVISIÓN HUMANA",
+        **base,
+        "rationale": "Evaluación local por reglas porque Ollama no respondió o no devolvió JSON válido.",
+        "follow_up_question": "Gracias. ¿Podrías darme un ejemplo concreto relacionado con seguridad, calidad o trabajo en equipo?",
     }
 
 
-def next_followup_question(last_question: str, last_answer: str, role_name: str, openai_key: str) -> str:
-    if not openai_key:
-        return "Gracias. Para profundizar, ¿podés darme un ejemplo concreto relacionado con seguridad, calidad o trabajo en equipo?"
-    client = client_openai(openai_key)
+def next_question_with_ollama(history: List[Dict], role: str, model: str, url: str, fallback: str) -> str:
+    transcript = "\n".join([f"Alba: {h['question']}\nCandidato: {h['answer']}" for h in history])
     prompt = f"""
 Sos Alba, entrevistadora virtual de RRHH para una empresa autopartista plástica.
-Puesto: {role_name}
-Última pregunta: {last_question}
-Respuesta del candidato: {last_answer}
-
-Generá UNA repregunta breve, cálida y profesional para profundizar solo si la respuesta fue incompleta o genérica.
-No preguntes datos sensibles. No menciones edad, familia, salud, religión, política, sindicato, nacionalidad, domicilio exacto ni estado civil.
-Máximo 35 palabras.
+Puesto: {role}.
+Con base en este historial, generá UNA sola repregunta breve, profesional y concreta.
+No preguntes datos sensibles. No hagas preguntas sobre edad, salud, familia, religión, política, sindicato o estado civil.
+Historial:
+{transcript}
 """
-    response = client.responses.create(model="gpt-4.1-mini", input=prompt, temperature=0.3)
-    return response.output_text.strip()
+    out = call_ollama(prompt, model, url)
+    if out:
+        return out.split("\n")[0].strip().strip('"')[:450]
+    return fallback
 
 
-def append_history(row: Dict):
-    df_new = pd.DataFrame([row])
-    if os.path.exists(HISTORY_FILE):
-        df_old = pd.read_csv(HISTORY_FILE)
-        df = pd.concat([df_old, df_new], ignore_index=True)
-    else:
-        df = df_new
-    df.to_csv(HISTORY_FILE, index=False)
-    return df
+if WEBRTC_AVAILABLE:
+    class SafeVideoProcessor(VideoProcessorBase):
+        def __init__(self):
+            self.frame_count = 0
+            self.face_detected_count = 0
+            self.last_face_present = False
+            if MEDIAPIPE_AVAILABLE:
+                self.mp_face = mp.solutions.face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5)
+            else:
+                self.mp_face = None
+
+        def recv(self, frame):
+            img = frame.to_ndarray(format="bgr24")
+            self.frame_count += 1
+            face_present = False
+            if self.mp_face is not None and self.frame_count % 5 == 0:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                res = self.mp_face.process(rgb)
+                face_present = bool(res.detections)
+                self.last_face_present = face_present
+                if face_present:
+                    self.face_detected_count += 1
+            label = "Camara activa"
+            cv2.putText(img, label, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
-def init_state():
-    defaults = {
-        "q_index": 0,
-        "answers": [],
-        "video_urls": {},
-        "current_transcript": "",
-        "last_audio_path": "",
-        "camera_on": False,
-        "evaluation": None,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-
-st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon="🎙️")
-init_state()
+st.set_page_config(page_title=APP_TITLE, page_icon="🎙️", layout="wide")
 
 st.markdown("""
 <style>
-.main .block-container {padding-top: 1rem; max-width: 1500px;}
-.alba-card {border: 1px solid #e6e8f5; border-radius: 18px; padding: 18px; background: #ffffff; box-shadow: 0 6px 24px rgba(20, 20, 70, .08);}
-.chat-bubble {background: #eef1ff; border-left: 5px solid #635bff; padding: 18px; border-radius: 18px; margin-bottom: 14px; font-size: 1.05rem;}
-.user-bubble {background: #eaf4ff; padding: 18px; border-radius: 18px; margin-bottom: 14px; font-size: 1.05rem;}
-.safe-note {background: #f6fff8; border-left: 5px solid #19a05b; padding: 12px 16px; border-radius: 10px;}
-.warning-note {background: #fff8e5; border-left: 5px solid #d89b00; padding: 12px 16px; border-radius: 10px;}
+.main-card{border:1px solid #E7EAF3;border-radius:18px;padding:18px;background:#fff;box-shadow:0 8px 30px rgba(20,30,60,.06)}
+.alba-bubble{border-left:5px solid #6757ff;background:#eef1ff;border-radius:18px;padding:18px;font-size:18px;line-height:1.5}
+.user-bubble{background:#eaf4ff;border-radius:18px;padding:18px;font-size:17px;line-height:1.5}
+.safe-note{background:#fff8df;border-radius:12px;padding:12px;border-left:4px solid #d4a000}
 </style>
 """, unsafe_allow_html=True)
 
+if "step" not in st.session_state:
+    st.session_state.step = 0
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "current_video_url" not in st.session_state:
+    st.session_state.current_video_url = ""
+if "current_question" not in st.session_state:
+    st.session_state.current_question = ""
+if "last_transcript" not in st.session_state:
+    st.session_state.last_transcript = ""
+
 with st.sidebar:
-    st.title("⚙️ Configuración")
-    did_key = st.text_input("D_ID_API_KEY", value=get_secret("D_ID_API_KEY"), type="password")
-    source_url = st.text_input("D_ID_SOURCE_URL", value=get_secret("D_ID_SOURCE_URL"))
-    openai_key = st.text_input("OPENAI_API_KEY", value=get_secret("OPENAI_API_KEY"), type="password")
+    st.header("Configuración")
+    role = st.selectbox("Puesto", list(ROLE_QUESTIONS.keys()))
+    did_api_key = st.text_input("D_ID_API_KEY", value=get_secret("D_ID_API_KEY"), type="password")
+    did_source_url = st.text_input("D_ID_SOURCE_URL", value=get_secret("D_ID_SOURCE_URL"))
+    did_voice = st.text_input("Voz D-ID", value=get_secret("D_ID_VOICE_ID", DEFAULT_DID_VOICE))
     st.divider()
-    role_name = st.selectbox("Puesto", ["Operario/a de inyección plástica", "Control de calidad", "Depósito / logística", "Mantenimiento", "Supervisor/a de turno"])
-    candidate_code = st.text_input("Código / nombre candidato", value="CAND-001")
+    st.subheader("Transcripción local")
+    whisper_model = st.selectbox("Modelo Whisper local", ["tiny", "base", "small", "medium"], index=1)
+    whisper_device = st.selectbox("Dispositivo", ["cpu", "cuda"], index=0)
+    compute_type = st.selectbox("Compute type", ["int8", "float32", "float16"], index=0)
+    st.caption("Para CPU usá base + int8. La primera transcripción puede tardar porque descarga el modelo.")
     st.divider()
-    st.caption("La cámara y el audio requieren permisos del navegador. Usá Chrome o Edge.")
+    st.subheader("Ollama local")
+    use_ollama = st.toggle("Usar Ollama para diálogo/evaluación", value=True)
+    ollama_model = st.text_input("Modelo Ollama", value="llama3.1")
+    ollama_url = st.text_input("URL Ollama", value=OLLAMA_URL_DEFAULT)
+    st.caption("Ejecutá en terminal: ollama pull llama3.1  /  ollama serve")
 
-st.title("🎙️ Alba — entrevista con avatar, cámara y diálogo por voz")
-st.caption("Flujo: Alba habla → candidato responde con cámara/micrófono → transcripción → repregunta o evaluación final.")
+questions = ROLE_QUESTIONS[role]
+if not st.session_state.current_question:
+    st.session_state.current_question = questions[0]
 
-st.markdown("""
-<div class='warning-note'>
-<b>Importante:</b> la app puede registrar cámara/audio y analizar contenido verbal. Para evitar sesgos, el análisis no verbal se limita a observables técnicos seguros: cámara encendida, audio comprensible y continuidad. No se infieren emociones, salud, honestidad ni personalidad por gestos.
-</div>
-""", unsafe_allow_html=True)
+st.title("Alba — entrevista con avatar, cámara y diálogo local")
+st.caption("Sin OpenAI API: transcripción con Faster Whisper local + diálogo/evaluación con Ollama local. D-ID se usa solo para el avatar hablando.")
 
-if not did_key or not source_url:
-    st.warning("Para que Alba hable con labios sincronizados, completá D_ID_API_KEY y D_ID_SOURCE_URL en el panel izquierdo.")
-if not openai_key:
-    st.warning("Para transcripción automática y repreguntas inteligentes, completá OPENAI_API_KEY. Sin eso, podés escribir la respuesta manualmente.")
+if not FASTER_WHISPER_AVAILABLE:
+    st.warning("No está instalado faster-whisper. Instalá dependencias con: pip install -r requirements.txt")
+if not WEBRTC_AVAILABLE:
+    st.warning("No está instalado streamlit-webrtc. La cámara puede no funcionar.")
+if not did_api_key or not did_source_url:
+    st.warning("Para que Alba hable con labios sincronizados completá D_ID_API_KEY y D_ID_SOURCE_URL.")
 
-progress = (st.session_state.q_index + 1) / len(QUESTIONS)
+progress = min((st.session_state.step + 1) / len(questions), 1.0)
 st.progress(progress)
 
-q_index = st.session_state.q_index
-current_question = QUESTIONS[q_index]
-
-col_avatar, col_chat = st.columns([1.25, 1])
-
-with col_avatar:
+col1, col2 = st.columns([1.25, 1])
+with col1:
     st.subheader("🎥 Cámara del candidato")
-    st.markdown("<div class='safe-note'>Pedí consentimiento antes de grabar. La cámara sirve para confirmar presencia y condiciones técnicas, no para inferir emociones.</div>", unsafe_allow_html=True)
-
+    st.markdown("<div class='main-card'>", unsafe_allow_html=True)
     if WEBRTC_AVAILABLE:
+        rtc_config = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
         ctx = webrtc_streamer(
-            key="candidate_camera",
+            key="candidate-camera",
             mode=WebRtcMode.SENDRECV,
-            video_html_attrs=VideoHTMLAttributes(autoPlay=True, controls=True, muted=True),
+            rtc_configuration=rtc_config,
+            video_processor_factory=SafeVideoProcessor if WEBRTC_AVAILABLE else None,
             media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
         )
-        st.session_state.camera_on = bool(ctx and ctx.state.playing)
+        camera_active = bool(ctx.state.playing)
     else:
-        st.info("No está instalado streamlit-webrtc. Instalá requirements.txt para cámara en vivo.")
-        camera_photo = st.camera_input("Foto de verificación técnica")
-        st.session_state.camera_on = camera_photo is not None
+        camera_active = st.camera_input("Activá cámara") is not None
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.subheader("🤖 Avatar Alba hablando")
-    if q_index not in st.session_state.video_urls:
-        if st.button("🎬 Generar video de Alba para esta pregunta", type="primary", use_container_width=True):
-            try:
-                with st.spinner("Generando video real con D-ID. Puede tardar unos segundos..."):
-                    st.session_state.video_urls[q_index] = generate_avatar_video(current_question, did_key, source_url)
-                st.rerun()
-            except Exception as e:
-                st.error(str(e))
+    st.subheader("🎬 Avatar hablando")
+    q = st.session_state.current_question
+    if st.button("Generar / reproducir pregunta con Alba", type="primary", use_container_width=True):
+        if not did_api_key or not did_source_url:
+            st.error("Falta D_ID_API_KEY o D_ID_SOURCE_URL.")
+        else:
+            with st.spinner("Generando video de Alba con D-ID..."):
+                try:
+                    st.session_state.current_video_url = create_did_video(q, did_api_key, did_source_url, did_voice)
+                except Exception as e:
+                    st.error(str(e))
+    if st.session_state.current_video_url:
+        st.video(st.session_state.current_video_url)
     else:
-        st.video(st.session_state.video_urls[q_index])
-        if st.button("🔁 Regenerar video", use_container_width=True):
-            st.session_state.video_urls.pop(q_index, None)
-            st.rerun()
+        st.image(did_source_url if did_source_url else "https://i.postimg.cc/jSwybb4C/4m0Obqg3KQUKRm1IAm-Ja-Hh-PB3qsae-Ih-TWs-Sc-JW3OMD5R-tsn-TJUy-W-xu-J4W1POFJAj-PGBQyh-Ik48GC4PNg-RGD7z.jpg")
 
-with col_chat:
-    st.subheader(f"💬 Conversación — Pregunta {q_index + 1} de {len(QUESTIONS)}")
-    st.markdown(f"<div class='chat-bubble'><b>Alba:</b><br>{current_question}</div>", unsafe_allow_html=True)
-
-    for item in st.session_state.answers:
-        st.markdown(f"<div class='chat-bubble'><b>Alba:</b><br>{item['question']}</div>", unsafe_allow_html=True)
+with col2:
+    st.subheader("💬 Conversación")
+    st.markdown(f"<div class='alba-bubble'><b>Alba:</b><br>{q}</div>", unsafe_allow_html=True)
+    for item in st.session_state.history[-4:]:
         st.markdown(f"<div class='user-bubble'><b>Candidato:</b><br>{item['answer']}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='alba-bubble'><b>Alba:</b><br>{item.get('next_question','')}</div>", unsafe_allow_html=True)
 
 st.divider()
-st.subheader("🎤 Respuesta del candidato")
-
+st.subheader("🎙️ Respuesta del candidato")
 left, right = st.columns([1, 1.25])
 with left:
-    st.markdown("**Opción A — responder hablando**")
     audio = mic_recorder(
         start_prompt="🎙️ Grabar respuesta",
         stop_prompt="⏹️ Detener grabación",
         just_once=False,
         use_container_width=True,
-        key=f"mic_{q_index}",
+        key=f"mic_{st.session_state.step}_{len(st.session_state.history)}",
     )
-    if audio:
+    if audio and audio.get("bytes"):
         st.audio(audio["bytes"])
-        audio_path = save_audio_bytes(audio, candidate_code, q_index)
-        st.session_state.last_audio_path = audio_path or ""
-        if st.button("📝 Transcribir automáticamente", type="primary", use_container_width=True):
-            try:
-                with st.spinner("Transcribiendo audio..."):
-                    st.session_state.current_transcript = transcribe_audio(audio_path, openai_key)
-                st.rerun()
-            except Exception as e:
-                st.error(str(e))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        audio_path = AUDIO_DIR / f"respuesta_{timestamp}.webm"
+        audio_path.write_bytes(audio["bytes"])
+        st.caption(f"Audio guardado localmente: {audio_path}")
+        if st.button("Transcribir automáticamente", type="primary", use_container_width=True):
+            with st.spinner("Transcribiendo con Faster Whisper local..."):
+                try:
+                    text = transcribe_local(audio["bytes"], ".webm", whisper_model, whisper_device, compute_type)
+                    st.session_state.last_transcript = text
+                except Exception as e:
+                    st.error(str(e))
 
 with right:
-    st.markdown("**Opción B — revisar o escribir respuesta**")
-    response_text = st.text_area(
-        "Respuesta del candidato",
-        value=st.session_state.current_transcript,
-        height=190,
-        placeholder="La transcripción aparecerá acá. También podés escribir manualmente la respuesta.",
+    answer = st.text_area(
+        "Respuesta transcripta / editable",
+        value=st.session_state.last_transcript,
+        height=180,
+        placeholder="La transcripción aparecerá acá. También podés escribir o corregir la respuesta manualmente.",
     )
 
-col1, col2, col3 = st.columns([1, 1, 1])
-with col1:
+st.markdown("<div class='safe-note'>La evaluación no infiere emociones, personalidad ni rasgos sensibles por la cámara. Solo registra observables técnicos seguros: cámara activa, audio comprensible y respuesta ordenada.</div>", unsafe_allow_html=True)
+
+c1, c2, c3 = st.columns([1, 1, 1])
+with c1:
     if st.button("Guardar respuesta y continuar diálogo", type="primary", use_container_width=True):
-        if not response_text.strip():
-            st.error("Primero grabá/transcribí o escribí la respuesta.")
+        if not answer.strip():
+            st.error("Primero grabá/transcribí o escribí una respuesta.")
         else:
-            st.session_state.answers.append({
-                "question": current_question,
-                "answer": response_text.strip(),
-                "audio_path": st.session_state.last_audio_path,
-                "camera_on": st.session_state.camera_on,
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            eval_data = ollama_evaluate(answer, role, ollama_model, ollama_url) if use_ollama else local_score(answer)
+            fallback_next = questions[min(st.session_state.step + 1, len(questions)-1)] if st.session_state.step + 1 < len(questions) else "Gracias. Ya tengo la información principal. El equipo de RRHH revisará la entrevista."
+            if use_ollama and st.session_state.step < len(questions)-1:
+                next_q = next_question_with_ollama(st.session_state.history + [{"question": q, "answer": answer}], role, ollama_model, ollama_url, fallback_next)
+            else:
+                next_q = fallback_next
+            st.session_state.history.append({
+                "timestamp": now_str(),
+                "role": role,
+                "question": q,
+                "answer": answer,
+                "next_question": next_q,
+                "camera_active": "sí" if camera_active else "no",
+                "evaluation": eval_data,
             })
-            st.session_state.current_transcript = ""
-            st.session_state.last_audio_path = ""
-            if st.session_state.q_index < len(QUESTIONS) - 1:
-                # If answer is generic, insert one adaptive follow-up by replacing next fixed question only when useful
-                if openai_key and len(response_text.split()) < 35:
-                    follow = next_followup_question(current_question, response_text, role_name, openai_key)
-                    QUESTIONS[min(st.session_state.q_index + 1, len(QUESTIONS) - 1)] = follow
-                st.session_state.q_index += 1
+            st.session_state.step = min(st.session_state.step + 1, len(questions)-1)
+            st.session_state.current_question = next_q
+            st.session_state.current_video_url = ""
+            st.session_state.last_transcript = ""
             st.rerun()
-with col2:
+with c2:
     if st.button("Volver pregunta anterior", use_container_width=True):
-        if st.session_state.q_index > 0:
-            st.session_state.q_index -= 1
+        if st.session_state.history:
+            st.session_state.history.pop()
+            st.session_state.step = max(st.session_state.step - 1, 0)
+            st.session_state.current_question = questions[st.session_state.step]
+            st.session_state.current_video_url = ""
             st.rerun()
-with col3:
+with c3:
     if st.button("Reiniciar entrevista", use_container_width=True):
-        for key in ["q_index", "answers", "video_urls", "current_transcript", "last_audio_path", "evaluation"]:
-            st.session_state.pop(key, None)
-        init_state()
+        st.session_state.step = 0
+        st.session_state.history = []
+        st.session_state.current_question = questions[0]
+        st.session_state.current_video_url = ""
+        st.session_state.last_transcript = ""
         st.rerun()
 
 st.divider()
-st.subheader("✅ Evaluación de Alba para RRHH")
+st.subheader("📊 Evaluación acumulada")
+if st.session_state.history:
+    all_text = "\n".join([h["answer"] for h in st.session_state.history])
+    final_eval = ollama_evaluate(all_text, role, ollama_model, ollama_url) if use_ollama else local_score(all_text)
+    m1, m2 = st.columns(2)
+    m1.metric("Recomendación preliminar", final_eval.get("recommendation", ""))
+    m2.metric("Score preliminar", f"{final_eval.get('score', 0)}/100")
+    st.write("**Fundamento:**", final_eval.get("rationale", "Evaluación preliminar local."))
+    st.write("**Fortalezas:**", final_eval.get("strengths", []))
+    st.write("**Riesgos/Brechas:**", final_eval.get("risks", []))
 
-if st.button("Evaluar entrevista completa", type="primary", use_container_width=True):
-    if not st.session_state.answers:
-        st.error("Todavía no hay respuestas para evaluar.")
-    else:
-        with st.spinner("Evaluando respuestas..."):
-            st.session_state.evaluation = evaluate_answers(candidate_code, role_name, st.session_state.answers, st.session_state.camera_on, openai_key)
-            row = {
-                "fecha": datetime.now().isoformat(timespec="seconds"),
-                "candidato": candidate_code,
-                "puesto": role_name,
-                "recomendacion": st.session_state.evaluation.get("recommendation"),
-                "puntaje": st.session_state.evaluation.get("score"),
-                "confianza": st.session_state.evaluation.get("confidence"),
-                "camara_encendida": st.session_state.camera_on,
-                "respuestas_json": json.dumps(st.session_state.answers, ensure_ascii=False),
-                "evaluacion_json": json.dumps(st.session_state.evaluation, ensure_ascii=False),
-            }
-            append_history(row)
-
-if st.session_state.evaluation:
-    ev = st.session_state.evaluation
-    a, b, c = st.columns(3)
-    a.metric("Recomendación", ev.get("recommendation", ""))
-    b.metric("Puntaje", f"{ev.get('score', 0)}/100")
-    c.metric("Confianza", ev.get("confidence", ""))
-    st.markdown("### Fundamento")
-    st.write(ev.get("rationale", ""))
-    st.markdown("### Observaciones verbales")
-    for item in ev.get("verbal_observations", []):
-        st.write(f"- {item}")
-    st.markdown("### Observaciones no verbales seguras")
-    for item in ev.get("nonverbal_observations", []):
-        st.write(f"- {item}")
-    st.markdown("### Fortalezas")
-    for item in ev.get("strengths", []):
-        st.write(f"- {item}")
-    st.markdown("### Riesgos / brechas")
-    for item in ev.get("risks", []):
-        st.write(f"- {item}")
-    st.json(ev, expanded=False)
-
-st.caption("La decisión final siempre debe quedar en RRHH/jefatura. La IA asiste, no reemplaza la decisión humana.")
+    rows = []
+    for i, h in enumerate(st.session_state.history, start=1):
+        rows.append({
+            "fecha": h["timestamp"], "pregunta_n": i, "puesto": h["role"], "pregunta": h["question"],
+            "respuesta": h["answer"], "camara_activa": h["camera_active"],
+            "recomendacion_parcial": h["evaluation"].get("recommendation", ""),
+            "score_parcial": h["evaluation"].get("score", ""),
+        })
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.download_button("Descargar entrevista CSV", df.to_csv(index=False).encode("utf-8"), "entrevista_alba.csv", "text/csv")
+    st.download_button("Descargar entrevista JSON", json.dumps(st.session_state.history, ensure_ascii=False, indent=2).encode("utf-8"), "entrevista_alba.json", "application/json")

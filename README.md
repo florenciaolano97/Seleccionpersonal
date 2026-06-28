@@ -1,75 +1,59 @@
-# AI-RRHH | Alba entrevistadora virtual con cámara, voz y D-ID
+# Alba RRHH — Streamlit sin OpenAI API
 
-Esta versión permite:
+Esta versión reemplaza OpenAI API por:
 
-- Avatar Alba hablando con labios sincronizados usando D-ID `/talks`.
-- Cámara encendida del candidato usando `streamlit-webrtc`.
-- Grabación de respuesta por micrófono.
-- Transcripción automática con OpenAI Whisper (`whisper-1`).
-- Repreguntas adaptativas con OpenAI.
-- Evaluación de respuestas verbales y observables no verbales seguros.
-- Historial local en `data/entrevistas_alba.csv`.
+- **Faster Whisper local** para transcribir audio.
+- **Ollama local** para diálogo adaptativo y evaluación.
+- **D-ID** para generar el video del avatar hablando con labios sincronizados.
+- **Streamlit WebRTC** para cámara del candidato.
 
-## Importante sobre evaluación no verbal
-
-La app NO infiere emociones, personalidad, salud, honestidad ni aptitud por gestos o apariencia. Solo registra observables técnicos seguros:
-
-- cámara encendida,
-- audio comprensible,
-- continuidad técnica,
-- respuesta verbal ordenada.
-
-La decisión final debe ser humana.
-
-## Instalación
+## 1. Instalar dependencias
 
 ```bash
-python -m venv venv
-venv\Scripts\activate  # Windows
-# source venv/bin/activate  # Mac/Linux
 pip install -r requirements.txt
+```
+
+> La primera transcripción puede tardar porque `faster-whisper` descarga el modelo elegido.
+
+## 2. Instalar Ollama
+
+Descargar desde: https://ollama.com
+
+Luego ejecutar:
+
+```bash
+ollama pull llama3.1
+ollama serve
+```
+
+En la app usar:
+
+```text
+Modelo Ollama: llama3.1
+URL Ollama: http://localhost:11434/api/generate
+```
+
+## 3. Configurar D-ID
+
+En el panel izquierdo de Streamlit completar:
+
+```text
+D_ID_API_KEY = tu credencial D-ID con formato usuario:password
+D_ID_SOURCE_URL = URL pública directa de la imagen .jpg/.png/.webp
+```
+
+Ejemplo de URL válida:
+
+```text
+https://i.postimg.cc/jSwybb4C/4m0Obqg3KQUKRm1IAm-Ja-Hh-PB3qsae-Ih-TWs-Sc-JW3OMD5R-tsn-TJUy-W-xu-J4W1POFJAj-PGBQyh-Ik48GC4PNg-RGD7z.jpg
+```
+
+## 4. Ejecutar
+
+```bash
 streamlit run app.py
 ```
 
-## Configuración necesaria
+## Alcance de evaluación no verbal
 
-Podés pegar las claves directamente en el panel izquierdo de Streamlit.
-
-### D_ID_API_KEY
-
-Pegá la credencial de D-ID con formato:
-
-```text
-usuario:password
-```
-
-La app la convierte automáticamente a `Basic base64(...)`.
-
-### D_ID_SOURCE_URL
-
-Pegá la URL pública directa de la imagen de Alba. Debe empezar con `https://` y terminar en `.jpg`, `.jpeg`, `.png` o `.webp`.
-
-Ejemplo:
-
-```text
-https://i.postimg.cc/jSwybb4C/avatar.jpg
-```
-
-### OPENAI_API_KEY
-
-Necesaria para:
-
-- transcribir audio,
-- generar repreguntas,
-- evaluar respuestas.
-
-## Uso recomendado
-
-1. Completar claves en sidebar.
-2. Activar cámara del candidato.
-3. Generar video de Alba.
-4. El candidato responde con micrófono.
-5. Transcribir automáticamente.
-6. Revisar o corregir texto.
-7. Guardar respuesta y continuar.
-8. Al final, evaluar entrevista completa.
+La app **no infiere emociones, personalidad, honestidad ni rasgos sensibles** por cámara. Solo registra observables seguros y técnicos: cámara activa, audio comprensible y respuesta ordenada.
