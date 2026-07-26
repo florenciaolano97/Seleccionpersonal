@@ -1,0 +1,14 @@
+# ALBA v2 + IA — Dependencias
+streamlit>=1.35.0
+pandas>=2.0.0
+pypdf>=4.0.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
+Pillow>=10.0.0
+
+# Inteligencia Artificial
+openai>=1.30.0
+
+# Avatar y videollamada (opcional)
+# streamlit-webrtc>=0.47.0
+# aiortc>=1.8.0
